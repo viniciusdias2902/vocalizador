@@ -1,0 +1,8 @@
+Command: ninja all
+[1/4] cd /Users/vyvy/Downloads/vocalizador/play_tone/build/esp-idf/esptool_py && /Users/vyvy/.espressif/python_env/idf5.5_py3.11_env/bin/python /Users/vyvy/esp/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app /Users/vyvy/Downloads/vocalizador/play_tone/build/partition_table/partition-table.bin /Users/vyvy/Downloads/vocalizador/play_tone/build/play_tone.bin
+play_tone.bin binary size 0x419e0 bytes. Smallest app partition is 0x100000 bytes. 0xbe620 bytes (74%) free.
+[2/4] Performing build step for 'bootloader'
+[1/1] cd /Users/vyvy/Downloads/vocalizador/play_tone/build/bootloader/esp-idf/esptool_py && /Users/vyvy/.espressif/python_env/idf5.5_py3.11_env/bin/python /Users/vyvy/esp/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x0 /Users/vyvy/Downloads/vocalizador/play_tone/build/bootloader/bootloader.bin
+Bootloader binary size 0x57e0 bytes. 0x2820 bytes (31%) free.
+[3/4] No install step for 'bootloader'
+[4/4] Completed 'bootloader'

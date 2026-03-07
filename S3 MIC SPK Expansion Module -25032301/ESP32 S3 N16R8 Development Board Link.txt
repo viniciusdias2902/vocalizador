@@ -1,0 +1,2 @@
+ESP32 S3 N16R8 development board data download:
+https://drive.google.com/drive/folders/1pUhX27FFflQ1B9MJt1R6m3KUoKkXlrxL?usp=sharing
