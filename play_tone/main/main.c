@@ -7,10 +7,19 @@
  *
  * ESP-IDF puro (sem ESP-ADF).
  * Áudio na PSRAM: 3 slots × 20 seg, 16kHz 16-bit mono.
+ *
+ * Persistência: cada slot é copiado para a partição SPIFFS "storage"
+ * (4 MB) ao ser atribuído e recarregado para a PSRAM no boot. Se a
+ * partição não montar, o aparelho funciona sem persistência.
+ *
+ * LED: apagado = ocioso | aceso = gravando, tocando ou salvando na flash
+ *      piscando = aguardando o botão de destino (10 s, depois descarta)
  */
 
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,6 +28,7 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_spiffs.h"
 
 static const char *TAG = "vocalizador";
 
@@ -59,6 +69,22 @@ static size_t   slot_len[NUM_SLOTS]  = { 0, 0, 0 };
 /* Buffer temporário de gravação */
 static uint8_t *rec_buf = NULL;
 static size_t   rec_len = 0;
+
+/* =====================================================================
+ * Persistência (SPIFFS)
+ * ===================================================================== */
+#ifndef STORAGE_BASE
+#define STORAGE_BASE        "/spiffs"
+#endif
+#define STORAGE_LABEL       "storage"           /* ver partitions.csv */
+#define SLOT_MAGIC          0x31434F56u         /* "VOC1" */
+
+typedef struct {
+    uint32_t magic;
+    uint32_t len;                               /* bytes de áudio após o cabeçalho */
+} slot_header_t;
+
+static bool storage_ok = false;
 
 /* =====================================================================
  * ES8388 - Driver I2C mínimo
@@ -359,6 +385,115 @@ static void do_record(void)
     ESP_LOGI(TAG, "Gravacao: %zu bytes (%.1f seg)", rec_len, sec);
 }
 
+/* =====================================================================
+ * Persistência em flash (SPIFFS)
+ * ===================================================================== */
+static void slot_path(int slot, char *buf, size_t n, bool tmp)
+{
+    snprintf(buf, n, STORAGE_BASE "/slot%d.%s", slot + 1, tmp ? "tmp" : "pcm");
+}
+
+/* Monta a partição. Em caso de falha o aparelho segue sem persistência. */
+static void storage_init(void)
+{
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = STORAGE_BASE,
+        .partition_label = STORAGE_LABEL,
+        .max_files = 2,
+        .format_if_mount_failed = true,
+    };
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "SPIFFS nao montou (%s): sem persistencia", esp_err_to_name(ret));
+        storage_ok = false;
+        return;
+    }
+    size_t total = 0, used = 0;
+    esp_spiffs_info(STORAGE_LABEL, &total, &used);
+    ESP_LOGI(TAG, "SPIFFS ok: %zu de %zu bytes em uso", used, total);
+    storage_ok = true;
+}
+
+/* Copia o slot da PSRAM para a flash. Grava em .tmp e renomeia,
+ * para que uma queda de energia no meio não corrompa o arquivo anterior. */
+static void storage_save(int slot)
+{
+    if (!storage_ok || slot_data[slot] == NULL || slot_len[slot] == 0) return;
+
+    char path[64], tmp[64];
+    slot_path(slot, path, sizeof(path), false);
+    slot_path(slot, tmp, sizeof(tmp), true);
+
+    gpio_set_level(LED_PIN, 1);                 /* LED aceso durante a escrita */
+    FILE *f = fopen(tmp, "wb");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Nao abriu %s para escrita", tmp);
+        gpio_set_level(LED_PIN, 0);
+        return;
+    }
+    slot_header_t hdr = { .magic = SLOT_MAGIC, .len = (uint32_t)slot_len[slot] };
+    bool ok = fwrite(&hdr, sizeof(hdr), 1, f) == 1 &&
+              fwrite(slot_data[slot], 1, slot_len[slot], f) == slot_len[slot];
+    ok = (fclose(f) == 0) && ok;
+
+    if (ok) {
+        remove(path);                           /* SPIFFS não sobrescreve no rename */
+        ok = rename(tmp, path) == 0;
+    }
+    if (!ok) {
+        ESP_LOGE(TAG, "Falha ao salvar slot %d na flash (%s)", slot + 1, strerror(errno));
+        remove(tmp);
+    } else {
+        ESP_LOGI(TAG, "Slot %d salvo na flash (%zu bytes)", slot + 1, slot_len[slot]);
+    }
+    gpio_set_level(LED_PIN, 0);
+}
+
+/* Recarrega um slot da flash para a PSRAM. Arquivo truncado ou inválido é descartado. */
+static void storage_load(int slot)
+{
+    char path[64];
+    slot_path(slot, path, sizeof(path), false);
+
+    struct stat st;
+    if (stat(path, &st) != 0) return;           /* slot nunca gravado */
+
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return;
+
+    slot_header_t hdr;
+    bool ok = fread(&hdr, sizeof(hdr), 1, f) == 1 &&
+              hdr.magic == SLOT_MAGIC &&
+              hdr.len > 0 && hdr.len <= MAX_SLOT_BYTES && (hdr.len % 2) == 0 &&
+              (size_t)st.st_size == sizeof(hdr) + hdr.len;
+
+    uint8_t *buf = NULL;
+    if (ok) {
+        buf = heap_caps_malloc(hdr.len, MALLOC_CAP_SPIRAM);
+        ok = buf != NULL && fread(buf, 1, hdr.len, f) == hdr.len;
+    }
+    fclose(f);
+
+    if (!ok) {
+        ESP_LOGW(TAG, "Slot %d na flash invalido ou truncado: descartado", slot + 1);
+        if (buf) heap_caps_free(buf);
+        remove(path);
+        return;
+    }
+    slot_data[slot] = buf;
+    slot_len[slot] = hdr.len;
+    ESP_LOGI(TAG, "Slot %d carregado da flash (%.1f seg)", slot + 1,
+             (float)hdr.len / (float)(SAMPLE_RATE * 2));
+}
+
+static void storage_load_all(void)
+{
+    if (!storage_ok) return;
+    for (int i = 0; i < NUM_SLOTS; i++) {
+        storage_load(i);
+    }
+}
+
 /* Salva a gravação temporária no slot escolhido */
 static void assign_recording(int slot)
 {
@@ -380,6 +515,9 @@ static void assign_recording(int slot)
 
     float sec = (float)slot_len[slot] / (float)(SAMPLE_RATE * 2);
     ESP_LOGI(TAG, "Audio salvo no slot %d (%.1f seg)", slot + 1, sec);
+
+    /* PSRAM é volátil: copia para a flash */
+    storage_save(slot);
 }
 
 /* =====================================================================
@@ -414,6 +552,10 @@ void app_main(void)
     i2c_init();
     es8388_init();
     i2s_init();
+
+    /* Persistência: monta a flash e recupera as mensagens gravadas */
+    storage_init();
+    storage_load_all();
 
     ESP_LOGI(TAG, "Pronto!");
     ESP_LOGI(TAG, "  Toque curto SW1/SW2/SW3: toca o audio do slot");
